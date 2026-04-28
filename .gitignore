@@ -13,3 +13,4 @@ wheels/
 uploads/
 faiss_index/
 .env
+.claude
