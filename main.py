@@ -1,17 +1,22 @@
 import os
 import shutil
+from dotenv import load_dotenv
+load_dotenv()
 import uuid
 from pathlib import Path
 from typing import List
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from langchain.chains import RetrievalQA
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader, TextLoader
 from langchain_community.document_loaders.word_document import Docx2txtLoader
 from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnablePassthrough
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
 app = FastAPI(title="Document Q&A System")
@@ -30,7 +35,7 @@ FAISS_DIR.mkdir(exist_ok=True)
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 
-embeddings = OpenAIEmbeddings()
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vector_store: FAISS | None = None
 
 
@@ -126,26 +131,40 @@ async def ask_question(body: AskRequest):
             status_code=404, detail="No documents indexed yet. Upload a document first."
         )
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
     retriever = store.as_retriever(search_kwargs={"k": body.k})
 
-    qa_chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True,
+    prompt = ChatPromptTemplate.from_template(
+        "Use the following context to answer the question. "
+        "If the answer is not in the context, say you don't know.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}"
     )
 
-    result = qa_chain.invoke({"query": body.question})
+    source_docs: list = []
+
+    def retrieve_and_track(question: str):
+        docs = retriever.invoke(question)
+        source_docs.extend(docs)
+        return "\n\n".join(doc.page_content for doc in docs)
+
+    chain = (
+        {"context": retrieve_and_track, "question": RunnablePassthrough()}
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    answer = chain.invoke(body.question)
 
     sources = list(
         {
             doc.metadata.get("source_filename", doc.metadata.get("source", "unknown"))
-            for doc in result["source_documents"]
+            for doc in source_docs
         }
     )
 
-    return AskResponse(answer=result["result"], sources=sources)
+    return AskResponse(answer=answer, sources=sources)
 
 
 @app.delete("/index")
