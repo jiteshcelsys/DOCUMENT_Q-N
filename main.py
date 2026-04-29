@@ -1,10 +1,12 @@
+import hashlib
+import json
 import os
 import shutil
 from dotenv import load_dotenv
 load_dotenv()
 import uuid
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Set
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +32,7 @@ app.add_middleware(
 
 UPLOAD_DIR = Path("uploads")
 FAISS_DIR = Path("faiss_index")
+INDEXED_FILES_PATH = FAISS_DIR / "indexed_files.json"
 UPLOAD_DIR.mkdir(exist_ok=True)
 FAISS_DIR.mkdir(exist_ok=True)
 
@@ -37,6 +40,24 @@ SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".txt"}
 
 embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 vector_store: FAISS | None = None
+
+
+def load_indexed_files() -> Dict[str, str]:
+    if INDEXED_FILES_PATH.exists():
+        return json.loads(INDEXED_FILES_PATH.read_text())
+    return {}
+
+
+def save_indexed_files(files: Dict[str, str]):
+    INDEXED_FILES_PATH.write_text(json.dumps(files))
+
+
+def compute_hash(data: bytes) -> str:
+    return hashlib.md5(data).hexdigest()
+
+
+# maps content_hash -> original filename
+indexed_files: Dict[str, str] = load_indexed_files()
 
 
 def get_vector_store() -> FAISS:
@@ -81,7 +102,7 @@ class UploadResponse(BaseModel):
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
-    global vector_store
+    global vector_store, indexed_files
 
     suffix = Path(file.filename).suffix.lower()
     if suffix not in SUPPORTED_EXTENSIONS:
@@ -90,9 +111,25 @@ async def upload_document(file: UploadFile = File(...)):
             detail=f"Unsupported file type '{suffix}'. Supported: {', '.join(SUPPORTED_EXTENSIONS)}",
         )
 
+    file_bytes = await file.read()
+    content_hash = compute_hash(file_bytes)
+
+    if content_hash in indexed_files:
+        existing_name = indexed_files[content_hash]
+        if existing_name == file.filename:
+            raise HTTPException(
+                status_code=409,
+                detail=f"'{file.filename}' is already indexed.",
+            )
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=f"This file's content is already indexed as '{existing_name}'.",
+            )
+
     save_path = UPLOAD_DIR / f"{uuid.uuid4()}{suffix}"
     with save_path.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+        f.write(file_bytes)
 
     try:
         docs = load_document(save_path)
@@ -115,6 +152,9 @@ async def upload_document(file: UploadFile = File(...)):
         vector_store.add_documents(chunks)
 
     vector_store.save_local(str(FAISS_DIR))
+
+    indexed_files[content_hash] = file.filename
+    save_indexed_files(indexed_files)
 
     return UploadResponse(
         filename=file.filename,
@@ -169,12 +209,18 @@ async def ask_question(body: AskRequest):
 
 @app.delete("/index")
 async def clear_index():
-    global vector_store
+    global vector_store, indexed_files
     vector_store = None
+    indexed_files = {}
     if FAISS_DIR.exists():
         shutil.rmtree(FAISS_DIR)
         FAISS_DIR.mkdir()
     return {"message": "Index cleared."}
+
+
+@app.get("/indexed-files")
+async def list_indexed_files():
+    return {"indexed_files": [{"filename": name, "hash": h} for h, name in indexed_files.items()]}
 
 
 @app.get("/health")

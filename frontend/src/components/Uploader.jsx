@@ -12,12 +12,16 @@ export default function Uploader({ onUploaded }) {
     if (!file) return;
     setError("");
     setProgress(0);
+    // Reset input so the same file can be selected again (triggers onChange)
+    if (inputRef.current) inputRef.current.value = "";
     try {
       const result = await uploadDocument(file, setProgress);
+      console.log(`Uploaded ${file.name}:`, result);
       setUploads((prev) => [result, ...prev]);
       onUploaded(result);
     } catch (e) {
       setError(e.message);
+      setTimeout(() => setError(""), 5000);
     } finally {
       setProgress(null);
     }
